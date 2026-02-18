@@ -14,12 +14,68 @@
 func malloc(n: int): *byte;
 func realloc(p: *byte, n: int): *byte;
 func free(p: *byte);
-func memcpy(dst: *byte, src: *byte, n: int): *byte;
-func memset(dst: *byte, val: int, n: int): *byte;
-func strcmp(a: *byte, b: *byte): int;
-func strncmp(a: *byte, b: *byte, n: int): int;
-func strlen(s: *byte): int;
-func strdup(s: *byte): *byte;
+func memcpy(dst: *byte, src: *byte, n: int): *byte {
+    var i: int = 0;
+    while (i < n) {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+    return dst;
+}
+
+//func memcpy(dst: *byte, src: *byte, n: int): *byte;
+func memset(dst: *byte, val: int, n: int): *byte {
+    var i: int = 0;
+    while (i < n) {
+        dst[i] = val;
+        i = i + 1;
+    }
+    return dst;
+}
+
+//func memset(dst: *byte, val: int, n: int): *byte;
+//func strcmp(a: *byte, b: *byte): int;
+func strcmp(a: *byte, b: *byte): int {
+    var i: int = 0;
+    while (a[i] != 0 && b[i] != 0) {
+        if (a[i] != b[i]) {
+            return a[i] - b[i];
+        }
+        i = i + 1;
+    }
+    return a[i] - b[i];
+}
+
+//func strncmp(a: *byte, b: *byte, n: int): int;
+func strncmp(a: *byte, b: *byte, n: int): int {
+    var i: int = 0;
+    while (i < n && a[i] != 0 && b[i] != 0) {
+        if (a[i] != b[i]) {
+            return a[i] - b[i];
+        }
+        i = i + 1;
+    }
+    if (i == n) {return 0;}
+    return a[i] - b[i];
+}
+
+//func strlen(s: *byte): int;
+func strlen(s: *byte): int {
+    var i: int = 0;
+    while (s[i] != 0) {
+        i = i + 1;
+    }
+    return i;
+}
+
+//func strdup(s: *byte): *byte;
+func strdup(s: *byte): *byte {
+    var len: int = strlen(s);
+    var p: *byte = malloc(len + 1);
+    memcpy(p, s, len + 1);
+    return p;
+}
+
 func fprintf(f: *byte, fmt: *byte): int;
 func printf(fmt: *byte): int;
 func fopen(path: *byte, mode: *byte): *byte;
@@ -31,12 +87,45 @@ func ftell(f: *byte): int;
 func rewind(f: *byte);
 func perror(s: *byte);
 func exit(code: int);
-func isdigit(c: int): int;
-func isalpha(c: int): int;
-func isalnum(c: int): int;
-func isspace(c: int): int;
-func isxdigit(c: int): int;
-func tolower(c: int): int;
+func isdigit(c: int): int {
+    return (c >= 48) && (c <= 57);
+}
+
+//func isdigit(c: int): int;
+func isalpha(c: int): int {
+    return (c >= 65 && c <= 90) ||
+           (c >= 97 && c <= 122);
+}
+
+//func isalpha(c: int): int;
+func isalnum(c: int): int {
+    return isdigit(c) || isalpha(c);
+}
+
+//func isalnum(c: int): int;
+func isspace(c: int): int {
+    return c == 32 ||  // space
+           c == 9  ||  // tab
+           c == 10 ||  // newline
+           c == 13;    // carriage return
+}
+
+//func isspace(c: int): int;
+func isxdigit(c: int): int {
+    return isdigit(c) ||
+           (c >= 65 && c <= 70) ||
+           (c >= 97 && c <= 102);
+}
+
+//func isxdigit(c: int): int;
+func tolower(c: int): int {
+    if (c >= 65 && c <= 90) {
+        return c + 32;
+    }
+    return c;
+}
+
+//func tolower(c: int): int;
 func vfprintf(f: *byte, fmt: *byte, ap: *byte): int;
 func va_start_impl(ap: *byte, last: *byte);
 func va_end_impl(ap: *byte);
