@@ -422,6 +422,8 @@ typedef enum {
     /* トップレベル */
     ND_FUNC,
     ND_STRUCT_DEF,
+    /* NodeKind に追加 */
+ND_EXTERN_DECL,  /* 外部関数宣言 */
 } NodeKind;
 
 typedef struct Node Node;
@@ -1058,7 +1060,13 @@ static Node *parse_func(Parser *p) {
     current_offset = 0;
     all_locals = new_vec();
     push_scope();
-
+if (!check(p, TK_LBRACE)) {
+    // 外部関数宣言 (セミコロンで終わる)
+    expect(p, TK_SEMICOLON);
+    // ND_FUNC を kind=ND_EXTERN として登録し、コード生成はスキップ
+    n->kind = ND_EXTERN_DECL;  // 新しいNodeKind
+    return n;
+}
     expect(p, TK_LPAREN);
     if (!check(p, TK_RPAREN)) {
         do {
@@ -1122,6 +1130,9 @@ static Vec *parse_program(const char *src) {
 
     /* 構造体メンバ型解決は既にパース中に行われている */
     /* (前方参照があれば size=0 のまま → エラー) */
+// parse_func_decl() の中で、'{' がなければ外部宣言として扱う
+// 追加箇所: parse_program() の関数パース部分
+
 
     return nodes;
 }
