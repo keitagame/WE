@@ -1,5 +1,5 @@
 /*
- * tinyc - セルフホスト可能な最小限コンパイラ
+ * Welang - セルフホスト可能な最小限コンパイラ
  *
  * 言語仕様:
  *   - 整数型 (int = 64bit)、ポインタ型 (*T)
@@ -1569,7 +1569,7 @@ static char *read_file(const char *path) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: tinyc <source.tc> [-o output.s]\n");
+        fprintf(stderr, "usage: wec <source.tc> [-o output.s]\n");
         return 1;
     }
 
