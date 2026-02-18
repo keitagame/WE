@@ -1,5 +1,5 @@
 /*
- * Welang - セルフホスト可能な最小限コンパイラ
+ * tinyc - セルフホスト可能な最小限コンパイラ
  *
  * 言語仕様:
  *   - 整数型 (int = 64bit)、ポインタ型 (*T)
@@ -422,8 +422,8 @@ typedef enum {
     /* トップレベル */
     ND_FUNC,
     ND_STRUCT_DEF,
-    /* NodeKind に追加 */
-ND_EXTERN_DECL,  /* 外部関数宣言 */
+    ND_EXTERN_DECL,  /* 外部関数宣言 (body なし) */
+    ND_GLOBAL_VAR,   /* グローバル変数宣言 */
 } NodeKind;
 
 typedef struct Node Node;
@@ -630,6 +630,7 @@ static Var *new_local(const char *name, Type *type) {
 
 /* 関数テーブル (シグネチャチェック用・省略: 名前のみ) */
 static Vec *func_names;
+static Vec *func_ret_types; /* 関数名に対応する返り値型 */
 
 
 /* 式パース */
@@ -664,7 +665,15 @@ static Node *parse_primary(Parser *p) {
             Node *n = new_node(ND_CALL, t->line);
             n->func_name = t->sval;
             n->args = new_vec();
-            n->type = ty_int; /* 返り値型: 仮 */
+            /* 返り値型を関数テーブルから検索 */
+            n->type = ty_int; /* デフォルト */
+            for (int fi = 0; fi < func_names->len; fi++) {
+                if (strcmp((char*)func_names->data[fi], t->sval) == 0) {
+                    Type *rt = (Type*)func_ret_types->data[fi];
+                    if (rt) n->type = rt;
+                    break;
+                }
+            }
             if (!check(p, TK_RPAREN)) {
                 vec_push(n->args, parse_expr(p));
                 while (match(p, TK_COMMA))
@@ -747,8 +756,6 @@ static Node *parse_postfix(Parser *p) {
             Node *nd = new_node(ND_MEMBER, line);
             nd->lhs = n;
             nd->field_name = fname->sval;
-            /* 型の解決は後で (フィールド解決フェーズ) */
-            nd->type = ty_int; /* 仮 */
             if (is_arrow) {
                 /* (*n).field に変換 */
                 Node *deref = new_node(ND_DEREF, line);
@@ -758,6 +765,20 @@ static Node *parse_postfix(Parser *p) {
                 else
                     die("line %d: -> on non-pointer", line);
                 nd->lhs = deref;
+            }
+            /* フィールドの型を解決 */
+            {
+                Type *sty = nd->lhs->type;
+                nd->type = ty_int; /* デフォルト */
+                if (sty->kind == TY_STRUCT && sty->fields) {
+                    for (int fi = 0; fi < sty->fields->len; fi++) {
+                        Field *ff = sty->fields->data[fi];
+                        if (strcmp(ff->name, fname->sval) == 0) {
+                            nd->type = ff->type;
+                            break;
+                        }
+                    }
+                }
             }
             n = nd;
             continue;
@@ -1051,6 +1072,8 @@ static Node *parse_func(Parser *p) {
     Token *t = expect(p, TK_FUNC);
     Token *name = expect(p, TK_IDENT);
     vec_push(func_names, name->sval);
+    /* ret_typeは後で確定するので仮にNULLを入れる (indexを合わせるため) */
+    vec_push(func_ret_types, NULL);
 
     Node *n = new_node(ND_FUNC, t->line);
     n->name = name->sval;
@@ -1060,13 +1083,7 @@ static Node *parse_func(Parser *p) {
     current_offset = 0;
     all_locals = new_vec();
     push_scope();
-if (!check(p, TK_LBRACE)) {
-    // 外部関数宣言 (セミコロンで終わる)
-    expect(p, TK_SEMICOLON);
-    // ND_FUNC を kind=ND_EXTERN として登録し、コード生成はスキップ
-    n->kind = ND_EXTERN_DECL;  // 新しいNodeKind
-    return n;
-}
+
     expect(p, TK_LPAREN);
     if (!check(p, TK_RPAREN)) {
         do {
@@ -1084,6 +1101,15 @@ if (!check(p, TK_LBRACE)) {
         n->ret_type = parse_type(p);
     else
         n->ret_type = ty_void;
+    /* 返り値型テーブルを更新 */
+    func_ret_types->data[func_ret_types->len - 1] = n->ret_type;
+
+    /* 外部宣言: body なしで ';' だけ */
+    if (match(p, TK_SEMICOLON)) {
+        pop_scope();
+        n->kind = ND_EXTERN_DECL;
+        return n;
+    }
 
     /* 本体 (スコープは既に open) */
     Token *lb = expect(p, TK_LBRACE);
@@ -1109,6 +1135,7 @@ static Vec *parse_program(const char *src) {
     p.pos = 0;
     p.structs = new_vec();
     func_names = new_vec();
+    func_ret_types = new_vec();
 
     /* 型初期化 */
     ty_int = new_type(TY_INT); ty_int->size = 8;
@@ -1123,6 +1150,32 @@ static Vec *parse_program(const char *src) {
             parse_struct_def(&p);
         } else if (check(&p, TK_FUNC)) {
             vec_push(nodes, parse_func(&p));
+        } else if (check(&p, TK_VAR)) {
+            /* グローバル変数宣言: var name: Type = expr; */
+            Token *vt = consume(&p);
+            Token *vname = expect(&p, TK_IDENT);
+            expect(&p, TK_COLON);
+            Type *vtype = parse_type(&p);
+            Node *gv = new_node(ND_GLOBAL_VAR, vt->line);
+            /* ラベル名 = 変数名 */
+            Var *v = xmalloc(sizeof(Var));
+            v->name = vname->sval;
+            v->type = vtype;
+            v->is_global = 1;
+            v->label = vname->sval;
+            v->offset = 0;
+            gv->var = v;
+            /* 初期値 (整数定数のみサポート) */
+            gv->ival = 0;
+            if (match(&p, TK_ASSIGN)) {
+                Token *init = expect(&p, TK_NUM);
+                gv->ival = init->ival;
+            }
+            expect(&p, TK_SEMICOLON);
+            /* グローバルスコープに登録 */
+            if (!current_scope) push_scope();
+            vec_push(current_scope->vars, v);
+            vec_push(nodes, gv);
         } else {
             die("line %d: expected func or struct", peek(&p)->line);
         }
@@ -1130,9 +1183,6 @@ static Vec *parse_program(const char *src) {
 
     /* 構造体メンバ型解決は既にパース中に行われている */
     /* (前方参照があれば size=0 のまま → エラー) */
-// parse_func_decl() の中で、'{' がなければ外部宣言として扱う
-// 追加箇所: parse_program() の関数パース部分
-
 
     return nodes;
 }
@@ -1580,7 +1630,7 @@ static char *read_file(const char *path) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: wec <source.tc> [-o output.s]\n");
+        fprintf(stderr, "usage: tinyc <source.tc> [-o output.s]\n");
         return 1;
     }
 
@@ -1603,6 +1653,32 @@ int main(int argc, char **argv) {
     fprintf(out, "  .section .note.GNU-stack,\"\",@progbits\n");
     emit("  .text");
     emit("");
+
+    /* グローバル変数 (BSS/DATAセクション) */
+    int has_globals = 0;
+    for (int i = 0; i < nodes->len; i++) {
+        Node *n = nodes->data[i];
+        if (n->kind == ND_GLOBAL_VAR) { has_globals = 1; break; }
+    }
+    if (has_globals) {
+        emit("  .data");
+        for (int i = 0; i < nodes->len; i++) {
+            Node *n = nodes->data[i];
+            if (n->kind == ND_GLOBAL_VAR) {
+                emit(".globl %s", n->var->label);
+                emit("%s:", n->var->label);
+                int sz = type_size(n->var->type);
+                if (sz <= 0) sz = 8;
+                if (n->ival != 0)
+                    emit("  .quad %lld", (long long)n->ival);
+                else
+                    emit("  .zero %d", sz);
+            }
+        }
+        emit("");
+        emit("  .text");
+        emit("");
+    }
 
     for (int i = 0; i < nodes->len; i++) {
         Node *n = nodes->data[i];

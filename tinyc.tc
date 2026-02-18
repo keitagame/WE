@@ -1,0 +1,1984 @@
+// tinyc.tc - tinyc言語で書かれたtinycコンパイラ自身
+// セルフホスト用ソース
+//
+// ビルド手順:
+//   gcc -o tinyc_stage0 main.c
+//   ./tinyc_stage0 tinyc.tc -o tinyc.s
+//   gcc -o tinyc tinyc.s
+//   ./tinyc tinyc.tc -o tinyc2.s   // 自己コンパイル確認
+
+// ================================================================
+// 外部関数宣言 (libc)
+// ================================================================
+
+func malloc(n: int): *byte;
+func realloc(p: *byte, n: int): *byte;
+func free(p: *byte);
+func memcpy(dst: *byte, src: *byte, n: int): *byte;
+func memset(dst: *byte, val: int, n: int): *byte;
+func strcmp(a: *byte, b: *byte): int;
+func strncmp(a: *byte, b: *byte, n: int): int;
+func strlen(s: *byte): int;
+func strdup(s: *byte): *byte;
+func fprintf(f: *byte, fmt: *byte): int;
+func printf(fmt: *byte): int;
+func fopen(path: *byte, mode: *byte): *byte;
+func fclose(f: *byte): int;
+func fread(buf: *byte, sz: int, n: int, f: *byte): int;
+func fwrite(buf: *byte, sz: int, n: int, f: *byte): int;
+func fseek(f: *byte, off: int, whence: int): int;
+func ftell(f: *byte): int;
+func rewind(f: *byte);
+func perror(s: *byte);
+func exit(code: int);
+func isdigit(c: int): int;
+func isalpha(c: int): int;
+func isalnum(c: int): int;
+func isspace(c: int): int;
+func isxdigit(c: int): int;
+func tolower(c: int): int;
+func vfprintf(f: *byte, fmt: *byte, ap: *byte): int;
+func va_start_impl(ap: *byte, last: *byte);
+func va_end_impl(ap: *byte);
+func sprintf(buf: *byte, fmt: *byte): int;
+func snprintf(buf: *byte, n: int, fmt: *byte): int;
+
+// ================================================================
+// ユーティリティ
+// ================================================================
+
+func xmalloc(n: int): *byte {
+    var p: *byte = malloc(n);
+    if p == 0 {
+        fprintf(stderr_ptr(), "error: out of memory\n");
+        exit(1);
+    }
+    return p;
+}
+
+func xrealloc(p: *byte, n: int): *byte {
+    var q: *byte = realloc(p, n);
+    if q == 0 {
+        fprintf(stderr_ptr(), "error: out of memory\n");
+        exit(1);
+    }
+    return q;
+}
+
+func xstrdup(s: *byte): *byte {
+    var p: *byte = strdup(s);
+    if p == 0 {
+        fprintf(stderr_ptr(), "error: out of memory\n");
+        exit(1);
+    }
+    return p;
+}
+
+func xstrndup(s: *byte, n: int): *byte {
+    var p: *byte = xmalloc(n + 1);
+    memcpy(p, s, n);
+    // p[n] = '\0'
+    var bp: *byte = p;
+    bp[n] = 0;
+    return p;
+}
+
+// stderr/stdout ポインタ取得 (libc の FILE* を取る補助関数)
+func stderr_ptr(): *byte;
+func stdout_ptr(): *byte;
+
+// ================================================================
+// 動的配列 Vec
+// ================================================================
+
+struct Vec {
+    data: *byte;   // void** を *byte で代用
+    len:  int;
+    cap:  int;
+}
+
+func new_vec(): *Vec {
+    var v: *Vec = xmalloc(sizeof(struct Vec));
+    v->data = xmalloc(8 * 8);  // 8 pointers * 8 bytes
+    v->len  = 0;
+    v->cap  = 8;
+    return v;
+}
+
+func vec_push(v: *Vec, item: *byte) {
+    if v->len == v->cap {
+        v->cap = v->cap * 2;
+        v->data = xrealloc(v->data, v->cap * 8);
+    }
+    // v->data[v->len] = item  (pointer array, each element 8 bytes)
+    var base: *byte = v->data;
+    var off: int = v->len * 8;
+    // store pointer-sized value
+    poke_ptr(base + off, item);
+    v->len = v->len + 1;
+}
+
+func vec_get(v: *Vec, i: int): *byte {
+    var base: *byte = v->data;
+    return peek_ptr(base + i * 8);
+}
+
+// 8バイトポインタの読み書き (コンパイラ内部ヘルパー)
+func poke_ptr(addr: *byte, val: *byte);
+func peek_ptr(addr: *byte): *byte;
+
+// ================================================================
+// 字句解析 (Lexer)
+// ================================================================
+
+// TokenKind 定数
+func TK_NUM():      int { return 0; }
+func TK_STR():      int { return 1; }
+func TK_IDENT():    int { return 2; }
+func TK_PLUS():     int { return 3; }
+func TK_MINUS():    int { return 4; }
+func TK_STAR():     int { return 5; }
+func TK_SLASH():    int { return 6; }
+func TK_PERCENT():  int { return 7; }
+func TK_AMP():      int { return 8; }
+func TK_BANG():     int { return 9; }
+func TK_EQ():       int { return 10; }
+func TK_NEQ():      int { return 11; }
+func TK_LT():       int { return 12; }
+func TK_LE():       int { return 13; }
+func TK_GT():       int { return 14; }
+func TK_GE():       int { return 15; }
+func TK_AND():      int { return 16; }
+func TK_OR():       int { return 17; }
+func TK_ASSIGN():   int { return 18; }
+func TK_LPAREN():   int { return 19; }
+func TK_RPAREN():   int { return 20; }
+func TK_LBRACE():   int { return 21; }
+func TK_RBRACE():   int { return 22; }
+func TK_LBRACKET(): int { return 23; }
+func TK_RBRACKET(): int { return 24; }
+func TK_COMMA():    int { return 25; }
+func TK_COLON():    int { return 26; }
+func TK_SEMICOLON():int { return 27; }
+func TK_DOT():      int { return 28; }
+func TK_ARROW():    int { return 29; }
+func TK_FUNC():     int { return 30; }
+func TK_VAR():      int { return 31; }
+func TK_RETURN():   int { return 32; }
+func TK_IF():       int { return 33; }
+func TK_ELSE():     int { return 34; }
+func TK_WHILE():    int { return 35; }
+func TK_STRUCT():   int { return 36; }
+func TK_SIZEOF():   int { return 37; }
+func TK_EOF():      int { return 38; }
+
+struct Token {
+    kind: int;
+    ival: int;
+    sval: *byte;
+    line: int;
+}
+
+func new_token(kind: int, line: int): *Token {
+    var t: *Token = xmalloc(sizeof(struct Token));
+    t->kind = kind;
+    t->ival = 0;
+    t->sval = 0;
+    t->line = line;
+    return t;
+}
+
+struct Lexer {
+    src:    *byte;
+    pos:    int;
+    line:   int;
+    tokens: *Vec;
+}
+
+func lex_peek(l: *Lexer): int {
+    var s: *byte = l->src;
+    return s[l->pos];
+}
+
+func lex_next(l: *Lexer): int {
+    var s: *byte = l->src;
+    var c: int = s[l->pos];
+    l->pos = l->pos + 1;
+    if c == 10 {   // '\n'
+        l->line = l->line + 1;
+    }
+    return c;
+}
+
+func lex_match(l: *Lexer, c: int): int {
+    var s: *byte = l->src;
+    if s[l->pos] == c {
+        l->pos = l->pos + 1;
+        return 1;
+    }
+    return 0;
+}
+
+func lex_peek2(l: *Lexer): int {
+    var s: *byte = l->src;
+    return s[l->pos + 1];
+}
+
+// キーワード照合
+func match_keyword(ident: *byte): int {
+    if strcmp(ident, "func")   == 0 { return TK_FUNC(); }
+    if strcmp(ident, "var")    == 0 { return TK_VAR(); }
+    if strcmp(ident, "return") == 0 { return TK_RETURN(); }
+    if strcmp(ident, "if")     == 0 { return TK_IF(); }
+    if strcmp(ident, "else")   == 0 { return TK_ELSE(); }
+    if strcmp(ident, "while")  == 0 { return TK_WHILE(); }
+    if strcmp(ident, "struct") == 0 { return TK_STRUCT(); }
+    if strcmp(ident, "sizeof") == 0 { return TK_SIZEOF(); }
+    return TK_IDENT();
+}
+
+func skip_whitespace_and_comments(l: *Lexer) {
+    var again: int = 1;
+    while again {
+        // 空白スキップ
+        while isspace(lex_peek(l)) {
+            lex_next(l);
+        }
+        // 行コメント '//'
+        if lex_peek(l) == 47 && lex_peek2(l) == 47 {
+            while lex_peek(l) != 0 && lex_peek(l) != 10 {
+                lex_next(l);
+            }
+        } else {
+        // ブロックコメント '/*'
+        if lex_peek(l) == 47 && lex_peek2(l) == 42 {
+            l->pos = l->pos + 2;
+            var in_comment: int = 1;
+            while in_comment {
+                if lex_peek(l) == 0 {
+                    in_comment = 0;
+                } else {
+                    if lex_peek(l) == 42 && lex_peek2(l) == 47 {
+                        l->pos = l->pos + 2;
+                        in_comment = 0;
+                    } else {
+                        lex_next(l);
+                    }
+                }
+            }
+        } else {
+            // スキップ対象なし -> ループ終了
+            again = 0;
+        }}
+    }
+}
+
+func tokenize(src: *byte): *Vec {
+    var l: Lexer;
+    l.src    = src;
+    l.pos    = 0;
+    l.line   = 1;
+    l.tokens = new_vec();
+
+    var running: int = 1;
+    while running {
+        skip_whitespace_and_comments(&l);
+
+        var line: int = l.line;
+        var c: int = lex_peek(&l);
+
+        if c == 0 {
+            vec_push(l.tokens, new_token(TK_EOF(), line));
+            return l.tokens;
+        } else {
+        // 数値リテラル
+        if isdigit(c) {
+            var t: *Token = new_token(TK_NUM(), line);
+            t->ival = 0;
+            var s: *byte = l.src;
+            if c == 48 && (s[l.pos + 1] == 120 || s[l.pos + 1] == 88) {
+                l.pos = l.pos + 2;
+                while isxdigit(lex_peek(&l)) {
+                    var d: int = lex_next(&l);
+                    var dval: int;
+                    if isdigit(d) {
+                        dval = d - 48;
+                    } else {
+                        dval = tolower(d) - 97 + 10;
+                    }
+                    t->ival = t->ival * 16 + dval;
+                }
+            } else {
+                while isdigit(lex_peek(&l)) {
+                    t->ival = t->ival * 10 + (lex_next(&l) - 48);
+                }
+            }
+            vec_push(l.tokens, t);
+        } else {
+        // 文字列リテラル
+        if c == 34 {
+            lex_next(&l);
+            var buf: byte[4096];
+            var len: int = 0;
+            while lex_peek(&l) != 34 && lex_peek(&l) != 0 {
+                var ch: int = lex_next(&l);
+                if ch == 92 {
+                    ch = lex_next(&l);
+                    if ch == 110 { buf[len] = 10; len = len + 1; }
+                    else if ch == 116 { buf[len] = 9;  len = len + 1; }
+                    else if ch == 48  { buf[len] = 0;  len = len + 1; }
+                    else if ch == 34  { buf[len] = 34; len = len + 1; }
+                    else if ch == 92  { buf[len] = 92; len = len + 1; }
+                    else { buf[len] = ch; len = len + 1; }
+                } else {
+                    buf[len] = ch;
+                    len = len + 1;
+                }
+            }
+            buf[len] = 0;
+            if lex_peek(&l) != 34 {
+                fprintf(stderr_ptr(), "error: unterminated string\n");
+                exit(1);
+            }
+            lex_next(&l);
+            var t: *Token = new_token(TK_STR(), line);
+            t->sval = xstrndup(&buf[0], len);
+            t->ival = len;
+            vec_push(l.tokens, t);
+        } else {
+        // 識別子・キーワード
+        if isalpha(c) || c == 95 {
+            var start: int = l.pos;
+            while isalnum(lex_peek(&l)) || lex_peek(&l) == 95 {
+                lex_next(&l);
+            }
+            var s2: *byte = l.src;
+            var ident: *byte = xstrndup(s2 + start, l.pos - start);
+            var kind: int = match_keyword(ident);
+            var t: *Token = new_token(kind, line);
+            t->sval = ident;
+            vec_push(l.tokens, t);
+        } else {
+            // 記号
+            lex_next(&l);
+            if c == 40 { vec_push(l.tokens, new_token(TK_LPAREN(),   line)); }
+            else if c == 41 { vec_push(l.tokens, new_token(TK_RPAREN(),   line)); }
+            else if c == 123{ vec_push(l.tokens, new_token(TK_LBRACE(),   line)); }
+            else if c == 125{ vec_push(l.tokens, new_token(TK_RBRACE(),   line)); }
+            else if c == 91 { vec_push(l.tokens, new_token(TK_LBRACKET(), line)); }
+            else if c == 93 { vec_push(l.tokens, new_token(TK_RBRACKET(), line)); }
+            else if c == 44 { vec_push(l.tokens, new_token(TK_COMMA(),    line)); }
+            else if c == 58 { vec_push(l.tokens, new_token(TK_COLON(),    line)); }
+            else if c == 59 { vec_push(l.tokens, new_token(TK_SEMICOLON(),line)); }
+            else if c == 37 { vec_push(l.tokens, new_token(TK_PERCENT(),  line)); }
+            else if c == 46 { vec_push(l.tokens, new_token(TK_DOT(),      line)); }
+            else if c == 43 { vec_push(l.tokens, new_token(TK_PLUS(),     line)); }
+            else if c == 45 {
+                if lex_match(&l, 62) {
+                    vec_push(l.tokens, new_token(TK_ARROW(), line));
+                } else {
+                    vec_push(l.tokens, new_token(TK_MINUS(), line));
+                }
+            }
+            else if c == 42 { vec_push(l.tokens, new_token(TK_STAR(),  line)); }
+            else if c == 47 { vec_push(l.tokens, new_token(TK_SLASH(), line)); }
+            else if c == 38 {
+                if lex_match(&l, 38) {
+                    vec_push(l.tokens, new_token(TK_AND(), line));
+                } else {
+                    vec_push(l.tokens, new_token(TK_AMP(), line));
+                }
+            }
+            else if c == 124 {
+                if lex_match(&l, 124) {
+                    vec_push(l.tokens, new_token(TK_OR(), line));
+                } else {
+                    fprintf(stderr_ptr(), "error: unexpected '|'\n");
+                    exit(1);
+                }
+            }
+            else if c == 33 {
+                if lex_match(&l, 61) {
+                    vec_push(l.tokens, new_token(TK_NEQ(), line));
+                } else {
+                    vec_push(l.tokens, new_token(TK_BANG(), line));
+                }
+            }
+            else if c == 61 {
+                if lex_match(&l, 61) {
+                    vec_push(l.tokens, new_token(TK_EQ(), line));
+                } else {
+                    vec_push(l.tokens, new_token(TK_ASSIGN(), line));
+                }
+            }
+            else if c == 60 {
+                if lex_match(&l, 61) {
+                    vec_push(l.tokens, new_token(TK_LE(), line));
+                } else {
+                    vec_push(l.tokens, new_token(TK_LT(), line));
+                }
+            }
+            else if c == 62 {
+                if lex_match(&l, 61) {
+                    vec_push(l.tokens, new_token(TK_GE(), line));
+                } else {
+                    vec_push(l.tokens, new_token(TK_GT(), line));
+                }
+            }
+            else {
+                fprintf(stderr_ptr(), "error: unexpected character\n");
+                exit(1);
+            }
+        }}}}  // end if-else chain
+        }     // end else branch
+    }         // end while running + func tokenize
+
+// ================================================================
+// 型システム
+// ================================================================
+
+// TypeKind 定数
+func TY_INT():    int { return 0; }
+func TY_PTR():    int { return 1; }
+func TY_ARRAY():  int { return 2; }
+func TY_STRUCT(): int { return 3; }
+func TY_FUNC():   int { return 4; }
+func TY_VOID():   int { return 5; }
+
+struct Type {
+    kind:      int;
+    base:      *Type;
+    array_len: int;
+    name:      *byte;
+    fields:    *Vec;
+    size:      int;
+    params:    *Vec;
+    ret:       *Type;
+}
+
+struct Field {
+    name:   *byte;
+    type_:  *Type;
+    offset: int;
+}
+
+// グローバル型
+var g_ty_int:  *Type = 0;
+var g_ty_byte: *Type = 0;
+var g_ty_void: *Type = 0;
+
+func new_type(kind: int): *Type {
+    var t: *Type = xmalloc(sizeof(struct Type));
+    t->kind      = kind;
+    t->base      = 0;
+    t->array_len = 0;
+    t->name      = 0;
+    t->fields    = 0;
+    t->size      = 0;
+    t->params    = 0;
+    t->ret       = 0;
+    return t;
+}
+
+func ptr_to(base: *Type): *Type {
+    var t: *Type = new_type(TY_PTR());
+    t->base = base;
+    t->size = 8;
+    return t;
+}
+
+func array_of(base: *Type, len: int): *Type {
+    var t: *Type = new_type(TY_ARRAY());
+    t->base      = base;
+    t->array_len = len;
+    t->size      = base->size * len;
+    return t;
+}
+
+func type_size(t: *Type): int {
+    return t->size;
+}
+
+func is_ptr(t: *Type): int {
+    return t->kind == TY_PTR() || t->kind == TY_ARRAY();
+}
+
+func deref_type(t: *Type): *Type {
+    if t->kind == TY_PTR()   { return t->base; }
+    if t->kind == TY_ARRAY() { return t->base; }
+    fprintf(stderr_ptr(), "error: not a pointer type\n");
+    exit(1);
+    return 0;
+}
+
+func init_types() {
+    g_ty_int  = new_type(TY_INT());  g_ty_int->size  = 8;
+    g_ty_byte = new_type(TY_INT());  g_ty_byte->size = 1;
+    g_ty_void = new_type(TY_VOID()); g_ty_void->size = 0;
+}
+
+// ================================================================
+// AST ノード
+// ================================================================
+
+// NodeKind 定数
+func ND_NUM():       int { return 0; }
+func ND_STR():       int { return 1; }
+func ND_VAR():       int { return 2; }
+func ND_ADDR():      int { return 3; }
+func ND_DEREF():     int { return 4; }
+func ND_NEG():       int { return 5; }
+func ND_NOT():       int { return 6; }
+func ND_SIZEOF():    int { return 7; }
+func ND_ADD():       int { return 8; }
+func ND_SUB():       int { return 9; }
+func ND_MUL():       int { return 10; }
+func ND_DIV():       int { return 11; }
+func ND_MOD():       int { return 12; }
+func ND_EQ():        int { return 13; }
+func ND_NEQ():       int { return 14; }
+func ND_LT():        int { return 15; }
+func ND_LE():        int { return 16; }
+func ND_AND():       int { return 17; }
+func ND_OR():        int { return 18; }
+func ND_ASSIGN():    int { return 19; }
+func ND_INDEX():     int { return 20; }
+func ND_MEMBER():    int { return 21; }
+func ND_CALL():      int { return 22; }
+func ND_BLOCK():     int { return 23; }
+func ND_VAR_DECL():  int { return 24; }
+func ND_RETURN():    int { return 25; }
+func ND_IF():        int { return 26; }
+func ND_WHILE():     int { return 27; }
+func ND_EXPR_STMT(): int { return 28; }
+func ND_FUNC():      int { return 29; }
+func ND_STRUCT_DEF():int { return 30; }
+func ND_EXTERN():    int { return 31; }
+
+struct Var {
+    name:      *byte;
+    type_:     *Type;
+    offset:    int;
+    is_global: int;
+    label:     *byte;
+}
+
+struct Node {
+    kind:       int;
+    type_:      *Type;
+    line:       int;
+    ival:       int;
+    sval:       *byte;
+    slen:       int;
+    str_label:  int;
+    var_:       *Var;
+    lhs:        *Node;
+    rhs:        *Node;
+    sizeof_type:*Type;
+    field_name: *byte;
+    field_:     *Field;
+    func_name:  *byte;
+    args:       *Vec;
+    stmts:      *Vec;
+    cond:       *Node;
+    then_:      *Node;
+    else_:      *Node;
+    body:       *Node;
+    init:       *Node;
+    name:       *byte;
+    params:     *Vec;
+    ret_type:   *Type;
+    func_body:  *Node;
+    local_size: int;
+}
+
+func new_node(kind: int, line: int): *Node {
+    var n: *Node = xmalloc(sizeof(struct Node));
+    memset(n, 0, sizeof(struct Node));
+    n->kind = kind;
+    n->line = line;
+    return n;
+}
+
+// ================================================================
+// パーサー
+// ================================================================
+
+struct Parser {
+    tokens:  *Vec;
+    pos:     int;
+    structs: *Vec;
+}
+
+func p_peek(p: *Parser): *Token {
+    return vec_get(p->tokens, p->pos);
+}
+
+func p_consume(p: *Parser): *Token {
+    var t: *Token = vec_get(p->tokens, p->pos);
+    p->pos = p->pos + 1;
+    return t;
+}
+
+func p_expect(p: *Parser, kind: int): *Token {
+    var t: *Token = p_consume(p);
+    if t->kind != kind {
+        fprintf(stderr_ptr(), "error: line %d: unexpected token\n");
+        exit(1);
+    }
+    return t;
+}
+
+func p_check(p: *Parser, kind: int): int {
+    var t: *Token = p_peek(p);
+    return t->kind == kind;
+}
+
+func p_match(p: *Parser, kind: int): int {
+    if p_check(p, kind) {
+        p_consume(p);
+        return 1;
+    }
+    return 0;
+}
+
+// スコープ
+struct Scope {
+    vars:   *Vec;
+    parent: *Scope;
+}
+
+var g_current_scope:  *Scope = 0;
+var g_current_offset: int    = 0;
+var g_all_locals:     *Vec   = 0;
+var g_func_names:     *Vec   = 0;
+var g_func_ret_types: *Vec   = 0;
+var g_str_count:      int    = 0;
+
+func push_scope(): *Scope {
+    var s: *Scope = xmalloc(sizeof(struct Scope));
+    s->vars   = new_vec();
+    s->parent = g_current_scope;
+    g_current_scope = s;
+    return s;
+}
+
+func pop_scope() {
+    g_current_scope = g_current_scope->parent;
+}
+
+func find_var(name: *byte): *Var {
+    var s: *Scope = g_current_scope;
+    while s != 0 {
+        var i: int = 0;
+        while i < s->vars->len {
+            var v: *Var = vec_get(s->vars, i);
+            if strcmp(v->name, name) == 0 {
+                return v;
+            }
+            i = i + 1;
+        }
+        s = s->parent;
+    }
+    return 0;
+}
+
+func new_local(name: *byte, type_: *Type): *Var {
+    var v: *Var = xmalloc(sizeof(struct Var));
+    v->name      = xstrdup(name);
+    v->type_     = type_;
+    var sz: int  = type_size(type_);
+    if sz < 8 { sz = 8; }
+    g_current_offset = g_current_offset - sz;
+    v->offset    = g_current_offset;
+    v->is_global = 0;
+    v->label     = 0;
+    vec_push(g_current_scope->vars, v);
+    vec_push(g_all_locals, v);
+    return v;
+}
+
+// 型パース (前方宣言)
+func parse_type(p: *Parser): *Type;
+func parse_expr(p: *Parser): *Node;
+func parse_stmt(p: *Parser): *Node;
+func parse_block(p: *Parser): *Node;
+
+func parse_base_type(p: *Parser): *Type {
+    var t: *Token = p_consume(p);
+    if t->kind == TK_IDENT() {
+        if strcmp(t->sval, "int")  == 0 { return g_ty_int; }
+        if strcmp(t->sval, "byte") == 0 { return g_ty_byte; }
+        if strcmp(t->sval, "void") == 0 { return g_ty_void; }
+    }
+    if t->kind == TK_VOID_KW() { return g_ty_void; }
+
+    var sname: *byte = 0;
+    if t->kind == TK_STRUCT() {
+        var name2: *Token = p_expect(p, TK_IDENT());
+        sname = name2->sval;
+    } else if t->kind == TK_IDENT() {
+        sname = t->sval;
+    } else {
+        fprintf(stderr_ptr(), "error: line %d: expected type\n");
+        exit(1);
+    }
+
+    // 既存の構造体を探す
+    var pp: *Parser = p;
+    var i: int = 0;
+    while i < pp->structs->len {
+        var s: *Type = vec_get(pp->structs, i);
+        if strcmp(s->name, sname) == 0 {
+            return s;
+        }
+        i = i + 1;
+    }
+    // 前方宣言
+    var s: *Type = new_type(TY_STRUCT());
+    s->name = xstrdup(sname);
+    vec_push(pp->structs, s);
+    return s;
+}
+
+func parse_type(p: *Parser): *Type {
+    if p_match(p, TK_STAR()) {
+        var base: *Type = parse_type(p);
+        return ptr_to(base);
+    }
+    var base: *Type = parse_base_type(p);
+    while p_check(p, TK_LBRACKET()) {
+        p_consume(p);
+        var nt: *Token = p_expect(p, TK_NUM());
+        p_expect(p, TK_RBRACKET());
+        base = array_of(base, nt->ival);
+    }
+    return base;
+}
+
+// sizeof のトークン種を void と区別するためのダミー
+func TK_VOID_KW(): int { return 39; }
+
+func parse_primary(p: *Parser): *Node {
+    var t: *Token = p_peek(p);
+
+    if t->kind == TK_NUM() {
+        p_consume(p);
+        var n: *Node = new_node(ND_NUM(), t->line);
+        n->ival  = t->ival;
+        n->type_ = g_ty_int;
+        return n;
+    }
+
+    if t->kind == TK_STR() {
+        p_consume(p);
+        var n: *Node = new_node(ND_STR(), t->line);
+        n->sval      = t->sval;
+        n->slen      = t->ival;
+        n->str_label = g_str_count;
+        g_str_count  = g_str_count + 1;
+        n->type_     = ptr_to(g_ty_byte);
+        return n;
+    }
+
+    if t->kind == TK_IDENT() {
+        p_consume(p);
+        if p_check(p, TK_LPAREN()) {
+            p_consume(p);
+            var n: *Node = new_node(ND_CALL(), t->line);
+            n->func_name = t->sval;
+            n->args      = new_vec();
+            n->type_     = g_ty_int;  // default
+            // 返り値型を関数テーブルから検索
+            var call_fi: int = 0;
+            while call_fi < g_func_names->len {
+                var fname_entry: *byte = peek_ptr(g_func_names->data + call_fi * 8);
+                if strcmp(fname_entry, t->sval) == 0 {
+                    var rtype: *Type = peek_ptr(g_func_ret_types->data + call_fi * 8);
+                    if rtype != 0 {
+                        n->type_ = rtype;
+                    }
+                    call_fi = g_func_names->len;  // break
+                }
+                call_fi = call_fi + 1;
+            }
+            if !p_check(p, TK_RPAREN()) {
+                vec_push(n->args, parse_expr(p));
+                while p_match(p, TK_COMMA()) {
+                    vec_push(n->args, parse_expr(p));
+                }
+            }
+            p_expect(p, TK_RPAREN());
+            return n;
+        }
+        var v: *Var = find_var(t->sval);
+        if v == 0 {
+            fprintf(stderr_ptr(), "error: line %d: undefined variable\n");
+            exit(1);
+        }
+        var n: *Node = new_node(ND_VAR(), t->line);
+        n->var_  = v;
+        n->type_ = v->type_;
+        return n;
+    }
+
+    if t->kind == TK_SIZEOF() {
+        p_consume(p);
+        p_expect(p, TK_LPAREN());
+        var next: *Token = p_peek(p);
+        var ty: *Type;
+        var is_type: int = 0;
+        if next->kind == TK_STAR() { is_type = 1; }
+        if next->kind == TK_STRUCT() { is_type = 1; }
+        if next->kind == TK_IDENT() {
+            if strcmp(next->sval, "int")  == 0 { is_type = 1; }
+            if strcmp(next->sval, "byte") == 0 { is_type = 1; }
+            if strcmp(next->sval, "void") == 0 { is_type = 1; }
+        }
+        if is_type {
+            ty = parse_type(p);
+        } else {
+            var e: *Node = parse_expr(p);
+            ty = e->type_;
+        }
+        p_expect(p, TK_RPAREN());
+        var n: *Node = new_node(ND_NUM(), t->line);
+        n->type_ = g_ty_int;
+        n->ival  = type_size(ty);
+        return n;
+    }
+
+    if t->kind == TK_LPAREN() {
+        p_consume(p);
+        var n: *Node = parse_expr(p);
+        p_expect(p, TK_RPAREN());
+        return n;
+    }
+
+    fprintf(stderr_ptr(), "error: line %d: unexpected token in expression\n");
+    exit(1);
+    return 0;
+}
+
+func parse_postfix(p: *Parser): *Node {
+    var n: *Node = parse_primary(p);
+    var running: int = 1;
+    while running {
+        if p_check(p, TK_LBRACKET()) {
+            var line: int = p_peek(p)->line;
+            p_consume(p);
+            var idx: *Node = parse_expr(p);
+            p_expect(p, TK_RBRACKET());
+            var nd: *Node = new_node(ND_INDEX(), line);
+            nd->lhs = n;
+            nd->rhs = idx;
+            if n->type_->kind == TY_PTR() || n->type_->kind == TY_ARRAY() {
+                nd->type_ = n->type_->base;
+            } else {
+                fprintf(stderr_ptr(), "error: subscript of non-array\n");
+                exit(1);
+            }
+            n = nd;
+        } else {
+        if p_check(p, TK_DOT()) || p_check(p, TK_ARROW()) {
+            var is_arrow: int = p_peek(p)->kind == TK_ARROW();
+            var line: int = p_peek(p)->line;
+            p_consume(p);
+            var fname: *Token = p_expect(p, TK_IDENT());
+            var nd: *Node = new_node(ND_MEMBER(), line);
+            nd->field_name = fname->sval;
+            nd->type_      = g_ty_int;  // default
+            if is_arrow {
+                var deref: *Node = new_node(ND_DEREF(), line);
+                deref->lhs = n;
+                if n->type_->kind == TY_PTR() {
+                    deref->type_ = n->type_->base;
+                } else {
+                    fprintf(stderr_ptr(), "error: -> on non-pointer\n");
+                    exit(1);
+                }
+                nd->lhs = deref;
+            } else {
+                nd->lhs = n;
+            }
+            // フィールドの型を解決
+            var member_sty: *Type = nd->lhs->type_;
+            if member_sty->kind == TY_STRUCT() && member_sty->fields != 0 {
+                var mfi: int = 0;
+                while mfi < member_sty->fields->len {
+                    var mff: *Field = vec_get(member_sty->fields, mfi);
+                    if strcmp(mff->name, fname->sval) == 0 {
+                        nd->type_ = mff->type_;
+                        mfi = member_sty->fields->len;  // break
+                    }
+                    mfi = mfi + 1;
+                }
+            }
+            n = nd;
+        } else {
+            running = 0;
+        }}
+    }
+    return n;
+}
+
+func parse_unary(p: *Parser): *Node {
+    var t: *Token = p_peek(p);
+    if t->kind == TK_MINUS() {
+        p_consume(p);
+        var n: *Node = new_node(ND_NEG(), t->line);
+        n->lhs   = parse_unary(p);
+        n->type_ = g_ty_int;
+        return n;
+    }
+    if t->kind == TK_BANG() {
+        p_consume(p);
+        var n: *Node = new_node(ND_NOT(), t->line);
+        n->lhs   = parse_unary(p);
+        n->type_ = g_ty_int;
+        return n;
+    }
+    if t->kind == TK_AMP() {
+        p_consume(p);
+        var n: *Node = new_node(ND_ADDR(), t->line);
+        n->lhs   = parse_unary(p);
+        n->type_ = ptr_to(n->lhs->type_);
+        return n;
+    }
+    if t->kind == TK_STAR() {
+        p_consume(p);
+        var n: *Node = new_node(ND_DEREF(), t->line);
+        n->lhs = parse_unary(p);
+        if !is_ptr(n->lhs->type_) {
+            fprintf(stderr_ptr(), "error: dereference of non-pointer\n");
+            exit(1);
+        }
+        n->type_ = deref_type(n->lhs->type_);
+        return n;
+    }
+    if t->kind == TK_SIZEOF() {
+        p_consume(p);
+        p_expect(p, TK_LPAREN());
+        var next: *Token = p_peek(p);
+        var ty: *Type;
+        var is_type: int = 0;
+        if next->kind == TK_STAR() { is_type = 1; }
+        if next->kind == TK_STRUCT() { is_type = 1; }
+        if next->kind == TK_IDENT() {
+            if strcmp(next->sval, "int")  == 0 { is_type = 1; }
+            if strcmp(next->sval, "byte") == 0 { is_type = 1; }
+            if strcmp(next->sval, "void") == 0 { is_type = 1; }
+        }
+        if is_type {
+            ty = parse_type(p);
+        } else {
+            var e: *Node = parse_expr(p);
+            ty = e->type_;
+        }
+        p_expect(p, TK_RPAREN());
+        var n: *Node = new_node(ND_NUM(), t->line);
+        n->type_ = g_ty_int;
+        n->ival  = type_size(ty);
+        return n;
+    }
+    return parse_postfix(p);
+}
+
+func parse_mul(p: *Parser): *Node {
+    var n: *Node = parse_unary(p);
+    var running: int = 1;
+    while running {
+        if p_check(p, TK_STAR()) || p_check(p, TK_SLASH()) || p_check(p, TK_PERCENT()) {
+            var op: *Token = p_consume(p);
+            var k: int;
+            if op->kind == TK_STAR()   { k = ND_MUL(); }
+            else if op->kind == TK_SLASH()   { k = ND_DIV(); }
+            else                             { k = ND_MOD(); }
+            var nd: *Node = new_node(k, op->line);
+            nd->lhs   = n;
+            nd->rhs   = parse_unary(p);
+            nd->type_ = g_ty_int;
+            n = nd;
+        } else {
+            running = 0;
+        }
+    }
+    return n;
+}
+
+func parse_add(p: *Parser): *Node {
+    var n: *Node = parse_mul(p);
+    var running: int = 1;
+    while running {
+        if p_check(p, TK_PLUS()) || p_check(p, TK_MINUS()) {
+            var op: *Token = p_consume(p);
+            var k: int;
+            if op->kind == TK_PLUS() { k = ND_ADD(); } else { k = ND_SUB(); }
+            var nd: *Node = new_node(k, op->line);
+            nd->lhs = n;
+            nd->rhs = parse_mul(p);
+            if is_ptr(n->type_) {
+                nd->type_ = n->type_;
+            } else if is_ptr(nd->rhs->type_) {
+                nd->type_ = nd->rhs->type_;
+            } else {
+                nd->type_ = g_ty_int;
+            }
+            n = nd;
+        } else {
+            running = 0;
+        }
+    }
+    return n;
+}
+
+func parse_rel(p: *Parser): *Node {
+    var n: *Node = parse_add(p);
+    var running: int = 1;
+    while running {
+        if p_check(p, TK_LT()) || p_check(p, TK_LE()) || p_check(p, TK_GT()) || p_check(p, TK_GE()) {
+            var op: *Token = p_consume(p);
+            var k: int;
+            var lhs: *Node = n;
+            var rhs: *Node = parse_add(p);
+            if op->kind == TK_LT() {
+                k = ND_LT();
+            } else if op->kind == TK_LE() {
+                k = ND_LE();
+            } else if op->kind == TK_GT() {
+                k = ND_LT();
+                var tmp: *Node = lhs; lhs = rhs; rhs = tmp;
+            } else {
+                k = ND_LE();
+                var tmp: *Node = lhs; lhs = rhs; rhs = tmp;
+            }
+            var nd: *Node = new_node(k, op->line);
+            nd->lhs = lhs; nd->rhs = rhs;
+            nd->type_ = g_ty_int;
+            n = nd;
+        } else {
+            running = 0;
+        }
+    }
+    return n;
+}
+
+func parse_eq(p: *Parser): *Node {
+    var n: *Node = parse_rel(p);
+    var running: int = 1;
+    while running {
+        if p_check(p, TK_EQ()) || p_check(p, TK_NEQ()) {
+            var op: *Token = p_consume(p);
+            var k: int;
+            if op->kind == TK_EQ() { k = ND_EQ(); } else { k = ND_NEQ(); }
+            var nd: *Node = new_node(k, op->line);
+            nd->lhs   = n;
+            nd->rhs   = parse_rel(p);
+            nd->type_ = g_ty_int;
+            n = nd;
+        } else {
+            running = 0;
+        }
+    }
+    return n;
+}
+
+func parse_logand(p: *Parser): *Node {
+    var n: *Node = parse_eq(p);
+    while p_check(p, TK_AND()) {
+        var op: *Token = p_consume(p);
+        var nd: *Node = new_node(ND_AND(), op->line);
+        nd->lhs = n; nd->rhs = parse_eq(p);
+        nd->type_ = g_ty_int;
+        n = nd;
+    }
+    return n;
+}
+
+func parse_logor(p: *Parser): *Node {
+    var n: *Node = parse_logand(p);
+    while p_check(p, TK_OR()) {
+        var op: *Token = p_consume(p);
+        var nd: *Node = new_node(ND_OR(), op->line);
+        nd->lhs = n; nd->rhs = parse_logand(p);
+        nd->type_ = g_ty_int;
+        n = nd;
+    }
+    return n;
+}
+
+func parse_assign(p: *Parser): *Node {
+    var n: *Node = parse_logor(p);
+    if p_check(p, TK_ASSIGN()) {
+        var op: *Token = p_consume(p);
+        var nd: *Node  = new_node(ND_ASSIGN(), op->line);
+        nd->lhs   = n;
+        nd->rhs   = parse_assign(p);
+        nd->type_ = n->type_;
+        return nd;
+    }
+    return n;
+}
+
+func parse_expr(p: *Parser): *Node {
+    return parse_assign(p);
+}
+
+func parse_stmt(p: *Parser): *Node {
+    var t: *Token = p_peek(p);
+
+    if t->kind == TK_RETURN() {
+        p_consume(p);
+        var n: *Node = new_node(ND_RETURN(), t->line);
+        if !p_check(p, TK_SEMICOLON()) {
+            n->lhs = parse_expr(p);
+        }
+        p_expect(p, TK_SEMICOLON());
+        return n;
+    }
+
+    if t->kind == TK_IF() {
+        p_consume(p);
+        var n: *Node = new_node(ND_IF(), t->line);
+        n->cond  = parse_expr(p);
+        n->then_ = parse_block(p);
+        if p_match(p, TK_ELSE()) {
+            if p_check(p, TK_IF()) {
+                n->else_ = parse_stmt(p);
+            } else {
+                n->else_ = parse_block(p);
+            }
+        }
+        return n;
+    }
+
+    if t->kind == TK_WHILE() {
+        p_consume(p);
+        var n: *Node = new_node(ND_WHILE(), t->line);
+        n->cond = parse_expr(p);
+        n->body = parse_block(p);
+        return n;
+    }
+
+    if t->kind == TK_LBRACE() {
+        return parse_block(p);
+    }
+
+    if t->kind == TK_VAR() {
+        p_consume(p);
+        var name: *Token = p_expect(p, TK_IDENT());
+        p_expect(p, TK_COLON());
+        var ty: *Type = parse_type(p);
+        var v: *Var   = new_local(name->sval, ty);
+        var n: *Node  = new_node(ND_VAR_DECL(), t->line);
+        n->var_ = v;
+        if p_match(p, TK_ASSIGN()) {
+            n->init = parse_expr(p);
+        }
+        p_expect(p, TK_SEMICOLON());
+        return n;
+    }
+
+    var n: *Node = new_node(ND_EXPR_STMT(), t->line);
+    n->lhs = parse_expr(p);
+    p_expect(p, TK_SEMICOLON());
+    return n;
+}
+
+func parse_block(p: *Parser): *Node {
+    var t: *Token = p_expect(p, TK_LBRACE());
+    var n: *Node  = new_node(ND_BLOCK(), t->line);
+    n->stmts = new_vec();
+    push_scope();
+    while !p_check(p, TK_RBRACE()) && !p_check(p, TK_EOF()) {
+        vec_push(n->stmts, parse_stmt(p));
+    }
+    p_expect(p, TK_RBRACE());
+    pop_scope();
+    return n;
+}
+
+func parse_struct_def(p: *Parser) {
+    p_expect(p, TK_STRUCT());
+    var name: *Token = p_expect(p, TK_IDENT());
+    p_expect(p, TK_LBRACE());
+
+    var s: *Type = 0;
+    var i: int = 0;
+    while i < p->structs->len {
+        var t2: *Type = vec_get(p->structs, i);
+        if strcmp(t2->name, name->sval) == 0 {
+            s = t2;
+        }
+        i = i + 1;
+    }
+    if s == 0 {
+        s = new_type(TY_STRUCT());
+        s->name = xstrdup(name->sval);
+        vec_push(p->structs, s);
+    }
+    s->fields = new_vec();
+
+    var offset: int = 0;
+    while !p_check(p, TK_RBRACE()) {
+        var fname: *Token = p_expect(p, TK_IDENT());
+        p_expect(p, TK_COLON());
+        var ftype: *Type = parse_type(p);
+        p_expect(p, TK_SEMICOLON());
+
+        var sz: int    = type_size(ftype);
+        var align: int = sz;
+        if align > 8 { align = 8; }
+        if align < 1 { align = 1; }
+        if offset % align != 0 {
+            offset = offset + align - (offset % align);
+        }
+
+        var f: *Field = xmalloc(sizeof(struct Field));
+        f->name   = xstrdup(fname->sval);
+        f->type_  = ftype;
+        f->offset = offset;
+        vec_push(s->fields, f);
+        offset = offset + sz;
+    }
+    if offset % 8 != 0 {
+        offset = offset + 8 - (offset % 8);
+    }
+    s->size = offset;
+    p_expect(p, TK_RBRACE());
+}
+
+func parse_func(p: *Parser): *Node {
+    var t: *Token = p_expect(p, TK_FUNC());
+    var name: *Token = p_expect(p, TK_IDENT());
+    vec_push(g_func_names, name->sval);
+    vec_push(g_func_ret_types, 0);  // placeholder, updated after ret_type parsed
+
+    var n: *Node = new_node(ND_FUNC(), t->line);
+    n->name   = name->sval;
+    n->params = new_vec();
+
+    g_current_offset = 0;
+    g_all_locals     = new_vec();
+    push_scope();
+
+    p_expect(p, TK_LPAREN());
+    if !p_check(p, TK_RPAREN()) {
+        var go: int = 1;
+        while go {
+            var pname: *Token = p_expect(p, TK_IDENT());
+            p_expect(p, TK_COLON());
+            var pty: *Type = parse_type(p);
+            var v: *Var    = new_local(pname->sval, pty);
+            vec_push(n->params, v);
+            if !p_match(p, TK_COMMA()) {
+                go = 0;
+            }
+        }
+    }
+    p_expect(p, TK_RPAREN());
+
+    if p_match(p, TK_COLON()) {
+        n->ret_type = parse_type(p);
+    } else {
+        n->ret_type = g_ty_void;
+    }
+    // 返り値型テーブルを更新
+    poke_ptr(g_func_ret_types->data + (g_func_ret_types->len - 1) * 8, n->ret_type);
+
+    // 外部宣言 (bodyなし)
+    if p_match(p, TK_SEMICOLON()) {
+        pop_scope();
+        n->kind = ND_EXTERN();
+        return n;
+    }
+
+    var lb: *Token = p_expect(p, TK_LBRACE());
+    var body: *Node = new_node(ND_BLOCK(), lb->line);
+    body->stmts = new_vec();
+    while !p_check(p, TK_RBRACE()) && !p_check(p, TK_EOF()) {
+        vec_push(body->stmts, parse_stmt(p));
+    }
+    p_expect(p, TK_RBRACE());
+    pop_scope();
+
+    n->func_body  = body;
+    n->local_size = 0 - g_current_offset;
+    return n;
+}
+
+func parse_program(src: *byte): *Vec {
+    init_types();
+    var tokens: *Vec = tokenize(src);
+    var p: Parser;
+    p.tokens  = tokens;
+    p.pos     = 0;
+    p.structs = new_vec();
+    g_func_names = new_vec();
+    g_func_ret_types = new_vec();
+
+    var nodes: *Vec = new_vec();
+    while !p_check(&p, TK_EOF()) {
+        if p_check(&p, TK_STRUCT()) {
+            parse_struct_def(&p);
+        } else if p_check(&p, TK_FUNC()) {
+            vec_push(nodes, parse_func(&p));
+        } else if p_check(&p, TK_VAR()) {
+            // グローバル変数宣言: var name: Type = 0;
+            var vt: *Token = p_consume(&p);
+            var vname: *Token = p_expect(&p, TK_IDENT());
+            p_expect(&p, TK_COLON());
+            var vtype: *Type = parse_type(&p);
+            var v: *Var = xmalloc(sizeof(struct Var));
+            v->name      = xstrdup(vname->sval);
+            v->type_     = vtype;
+            v->is_global = 1;
+            v->label     = xstrdup(vname->sval);
+            v->offset    = 0;
+            // 初期値 (整数のみ対応)
+            var init_val: int = 0;
+            if p_match(&p, TK_ASSIGN()) {
+                var init_tok: *Token = p_expect(&p, TK_NUM());
+                init_val = init_tok->ival;
+            }
+            p_expect(&p, TK_SEMICOLON());
+            // グローバルスコープに登録
+            if g_current_scope == 0 {
+                push_scope();
+            }
+            vec_push(g_current_scope->vars, v);
+            // グローバル変数ノード
+            var gn: *Node = new_node(ND_EXTERN(), vt->line);
+            gn->var_  = v;
+            gn->ival  = init_val;
+            gn->name  = v->name;
+            vec_push(nodes, gn);
+        } else {
+            fprintf(stderr_ptr(), "error: expected func or struct\n");
+            exit(1);
+        }
+    }
+    return nodes;
+}
+
+// ================================================================
+// コード生成
+// ================================================================
+
+var g_out:         *byte = 0;  // FILE*
+var g_label_count: int   = 0;
+var g_str_literals:*Vec  = 0;
+var g_stack_depth: int   = 0;
+
+// argregs: %rdi %rsi %rdx %rcx %r8 %r9
+func argreg(i: int): *byte {
+    if i == 0 { return "%rdi"; }
+    if i == 1 { return "%rsi"; }
+    if i == 2 { return "%rdx"; }
+    if i == 3 { return "%rcx"; }
+    if i == 4 { return "%r8"; }
+    if i == 5 { return "%r9"; }
+    return "%rdi";
+}
+
+func argreg_dword(i: int): *byte {
+    if i == 0 { return "%edi"; }
+    if i == 1 { return "%esi"; }
+    if i == 2 { return "%edx"; }
+    if i == 3 { return "%ecx"; }
+    if i == 4 { return "%r8d"; }
+    if i == 5 { return "%r9d"; }
+    return "%edi";
+}
+
+func new_label(): int {
+    var l: int = g_label_count;
+    g_label_count = g_label_count + 1;
+    return l;
+}
+
+func emit_str(s: *byte) {
+    fprintf(g_out, "%s", s);
+    fprintf(g_out, "\n");
+}
+
+func emit_1(fmt: *byte, a: *byte) {
+    fprintf(g_out, fmt, a);
+    fprintf(g_out, "\n");
+}
+
+func emit_2(fmt: *byte, a: *byte, b: *byte) {
+    fprintf(g_out, fmt, a, b);
+    fprintf(g_out, "\n");
+}
+
+func emit_int(fmt: *byte, a: int) {
+    fprintf(g_out, fmt, a);
+    fprintf(g_out, "\n");
+}
+
+func emit_int2(fmt: *byte, a: int, b: int) {
+    fprintf(g_out, fmt, a, b);
+    fprintf(g_out, "\n");
+}
+
+func push_reg(reg: *byte) {
+    emit_1("  pushq %s", reg);
+    g_stack_depth = g_stack_depth + 1;
+}
+
+func pop_reg(reg: *byte) {
+    emit_1("  popq %s", reg);
+    g_stack_depth = g_stack_depth - 1;
+}
+
+struct StrLiteral {
+    label: int;
+    data:  *byte;
+    len:   int;
+}
+
+func load(ty: *Type) {
+    pop_reg("%rax");
+    if ty->kind == TY_ARRAY() {
+        push_reg("%rax");
+        return;
+    }
+    var sz: int = type_size(ty);
+    if sz == 1 {
+        emit_str("  movsbq (%rax), %rax");
+    } else if sz == 2 {
+        emit_str("  movswq (%rax), %rax");
+    } else if sz == 4 {
+        emit_str("  movslq (%rax), %rax");
+    } else {
+        emit_str("  movq (%rax), %rax");
+    }
+    push_reg("%rax");
+}
+
+func store_mem(ty: *Type) {
+    pop_reg("%rdi");
+    pop_reg("%rax");
+    var sz: int = type_size(ty);
+    if sz == 1 {
+        emit_str("  movb %dil, (%rax)");
+    } else if sz == 2 {
+        emit_str("  movw %di, (%rax)");
+    } else if sz == 4 {
+        emit_str("  movl %edi, (%rax)");
+    } else {
+        emit_str("  movq %rdi, (%rax)");
+    }
+    push_reg("%rdi");
+}
+
+func gen_addr(n: *Node);
+func gen_val(n: *Node);
+
+func gen_addr(n: *Node) {
+    if n->kind == ND_VAR() {
+        if n->var_->is_global {
+            emit_1("  leaq %s(%%rip), %%rax", n->var_->label);
+        } else {
+            emit_int("  leaq %d(%%rbp), %%rax", n->var_->offset);
+        }
+        push_reg("%rax");
+        return;
+    }
+    if n->kind == ND_DEREF() {
+        gen_val(n->lhs);
+        return;
+    }
+    if n->kind == ND_INDEX() {
+        if n->lhs->type_->kind == TY_ARRAY() {
+            gen_addr(n->lhs);
+        } else {
+            gen_addr(n->lhs);
+            load(n->lhs->type_);
+        }
+        gen_val(n->rhs);
+        pop_reg("%rcx");
+        pop_reg("%rax");
+        var esz: int = type_size(n->type_);
+        emit_int("  imulq $%d, %%rcx", esz);
+        emit_str("  addq %rcx, %rax");
+        push_reg("%rax");
+        return;
+    }
+    if n->kind == ND_MEMBER() {
+        var sty: *Type = n->lhs->type_;
+        if sty->kind != TY_STRUCT() {
+            fprintf(stderr_ptr(), "error: member access on non-struct\n");
+            exit(1);
+        }
+        var f: *Field = 0;
+        var i: int = 0;
+        while i < sty->fields->len {
+            var fi: *Field = vec_get(sty->fields, i);
+            if strcmp(fi->name, n->field_name) == 0 {
+                f = fi;
+            }
+            i = i + 1;
+        }
+        if f == 0 {
+            fprintf(stderr_ptr(), "error: no such field\n");
+            exit(1);
+        }
+        n->field_ = f;
+        n->type_  = f->type_;
+        gen_addr(n->lhs);
+        pop_reg("%rax");
+        emit_int("  addq $%d, %%rax", f->offset);
+        push_reg("%rax");
+        return;
+    }
+    fprintf(stderr_ptr(), "error: not an lvalue\n");
+    exit(1);
+}
+
+func gen_val(n: *Node) {
+    if n->kind == ND_NUM() {
+        emit_int("  movq $%d, %%rax", n->ival);
+        push_reg("%rax");
+        return;
+    }
+    if n->kind == ND_STR() {
+        var sl: *StrLiteral = xmalloc(sizeof(struct StrLiteral));
+        sl->label = n->str_label;
+        sl->data  = n->sval;
+        sl->len   = n->slen;
+        vec_push(g_str_literals, sl);
+        emit_int("  leaq .LC%d(%%rip), %%rax", n->str_label);
+        push_reg("%rax");
+        return;
+    }
+    if n->kind == ND_VAR() || n->kind == ND_INDEX() || n->kind == ND_MEMBER() {
+        gen_addr(n);
+        load(n->type_);
+        return;
+    }
+    if n->kind == ND_DEREF() {
+        gen_val(n->lhs);
+        load(n->type_);
+        return;
+    }
+    if n->kind == ND_ADDR() {
+        gen_addr(n->lhs);
+        return;
+    }
+    if n->kind == ND_NEG() {
+        gen_val(n->lhs);
+        pop_reg("%rax");
+        emit_str("  negq %rax");
+        push_reg("%rax");
+        return;
+    }
+    if n->kind == ND_NOT() {
+        gen_val(n->lhs);
+        pop_reg("%rax");
+        emit_str("  cmpq $0, %rax");
+        emit_str("  sete %al");
+        emit_str("  movzbq %al, %rax");
+        push_reg("%rax");
+        return;
+    }
+    if n->kind == ND_ASSIGN() {
+        gen_addr(n->lhs);
+        gen_val(n->rhs);
+        store_mem(n->lhs->type_);
+        return;
+    }
+    if n->kind == ND_ADD() {
+        gen_val(n->lhs);
+        gen_val(n->rhs);
+        pop_reg("%rdi");
+        pop_reg("%rax");
+        if is_ptr(n->lhs->type_) {
+            emit_int("  imulq $%d, %%rdi", type_size(n->lhs->type_->base));
+        } else if is_ptr(n->rhs->type_) {
+            emit_int("  imulq $%d, %%rax", type_size(n->rhs->type_->base));
+        }
+        emit_str("  addq %rdi, %rax");
+        push_reg("%rax");
+        return;
+    }
+    if n->kind == ND_SUB() {
+        gen_val(n->lhs);
+        gen_val(n->rhs);
+        pop_reg("%rdi");
+        pop_reg("%rax");
+        if is_ptr(n->lhs->type_) && !is_ptr(n->rhs->type_) {
+            emit_int("  imulq $%d, %%rdi", type_size(n->lhs->type_->base));
+        }
+        emit_str("  subq %rdi, %rax");
+        if is_ptr(n->lhs->type_) && is_ptr(n->rhs->type_) {
+            emit_str("  cqo");
+            emit_int("  movq $%d, %%rdi", type_size(n->lhs->type_->base));
+            emit_str("  idivq %rdi");
+        }
+        push_reg("%rax");
+        return;
+    }
+    if n->kind == ND_MUL() {
+        gen_val(n->lhs);
+        gen_val(n->rhs);
+        pop_reg("%rdi");
+        pop_reg("%rax");
+        emit_str("  imulq %rdi, %rax");
+        push_reg("%rax");
+        return;
+    }
+    if n->kind == ND_DIV() || n->kind == ND_MOD() {
+        gen_val(n->lhs);
+        gen_val(n->rhs);
+        pop_reg("%rcx");
+        pop_reg("%rax");
+        emit_str("  cqo");
+        emit_str("  idivq %rcx");
+        if n->kind == ND_DIV() {
+            push_reg("%rax");
+        } else {
+            emit_str("  movq %rdx, %rax");
+            push_reg("%rax");
+        }
+        return;
+    }
+    if n->kind == ND_EQ() || n->kind == ND_NEQ() || n->kind == ND_LT() || n->kind == ND_LE() {
+        gen_val(n->lhs);
+        gen_val(n->rhs);
+        pop_reg("%rdi");
+        pop_reg("%rax");
+        emit_str("  cmpq %rdi, %rax");
+        if n->kind == ND_EQ()  { emit_str("  sete %al"); }
+        if n->kind == ND_NEQ() { emit_str("  setne %al"); }
+        if n->kind == ND_LT()  { emit_str("  setl %al"); }
+        if n->kind == ND_LE()  { emit_str("  setle %al"); }
+        emit_str("  movzbq %al, %rax");
+        push_reg("%rax");
+        return;
+    }
+    if n->kind == ND_AND() {
+        var l: int = new_label();
+        gen_val(n->lhs);
+        pop_reg("%rax");
+        emit_str("  cmpq $0, %rax");
+        emit_int("  je .Lfalse%d", l);
+        gen_val(n->rhs);
+        pop_reg("%rax");
+        emit_str("  cmpq $0, %rax");
+        emit_int("  je .Lfalse%d", l);
+        emit_str("  movq $1, %rax");
+        emit_int("  jmp .Lend%d", l);
+        emit_int(".Lfalse%d:", l);
+        emit_str("  movq $0, %rax");
+        emit_int(".Lend%d:", l);
+        push_reg("%rax");
+        return;
+    }
+    if n->kind == ND_OR() {
+        var l: int = new_label();
+        gen_val(n->lhs);
+        pop_reg("%rax");
+        emit_str("  cmpq $0, %rax");
+        emit_int("  jne .Ltrue%d", l);
+        gen_val(n->rhs);
+        pop_reg("%rax");
+        emit_str("  cmpq $0, %rax");
+        emit_int("  jne .Ltrue%d", l);
+        emit_str("  movq $0, %rax");
+        emit_int("  jmp .Lend%d", l);
+        emit_int(".Ltrue%d:", l);
+        emit_str("  movq $1, %rax");
+        emit_int(".Lend%d:", l);
+        push_reg("%rax");
+        return;
+    }
+    if n->kind == ND_CALL() {
+        var nargs: int = n->args->len;
+        if nargs > 6 {
+            fprintf(stderr_ptr(), "error: too many arguments\n");
+            exit(1);
+        }
+        var i: int = 0;
+        while i < nargs {
+            gen_val(vec_get(n->args, i));
+            i = i + 1;
+        }
+        var j: int = nargs - 1;
+        while j >= 0 {
+            pop_reg(argreg(j));
+            j = j - 1;
+        }
+        if g_stack_depth % 2 != 0 {
+            emit_str("  subq $8, %rsp");
+            g_stack_depth = g_stack_depth + 1;
+            emit_str("  movq $0, %rax");
+            emit_1("  call %s", n->func_name);
+            emit_str("  addq $8, %rsp");
+            g_stack_depth = g_stack_depth - 1;
+        } else {
+            emit_str("  movq $0, %rax");
+            emit_1("  call %s", n->func_name);
+        }
+        push_reg("%rax");
+        return;
+    }
+    fprintf(stderr_ptr(), "error: gen_val: unknown node kind\n");
+    exit(1);
+}
+
+func gen_stmt(n: *Node, ret_label: int) {
+    if n->kind == ND_BLOCK() {
+        var i: int = 0;
+        while i < n->stmts->len {
+            gen_stmt(vec_get(n->stmts, i), ret_label);
+            i = i + 1;
+        }
+        return;
+    }
+    if n->kind == ND_EXPR_STMT() {
+        gen_val(n->lhs);
+        pop_reg("%rax");
+        return;
+    }
+    if n->kind == ND_VAR_DECL() {
+        if n->init != 0 {
+            var var_node: *Node = new_node(ND_VAR(), n->line);
+            var_node->var_  = n->var_;
+            var_node->type_ = n->var_->type_;
+            var assign: *Node = new_node(ND_ASSIGN(), n->line);
+            assign->lhs   = var_node;
+            assign->rhs   = n->init;
+            assign->type_ = n->var_->type_;
+            var stmt: *Node = new_node(ND_EXPR_STMT(), n->line);
+            stmt->lhs = assign;
+            gen_stmt(stmt, ret_label);
+        }
+        return;
+    }
+    if n->kind == ND_RETURN() {
+        if n->lhs != 0 {
+            gen_val(n->lhs);
+            pop_reg("%rax");
+        } else {
+            emit_str("  movq $0, %rax");
+        }
+        emit_int("  jmp .Lret%d", ret_label);
+        return;
+    }
+    if n->kind == ND_IF() {
+        var l: int = new_label();
+        gen_val(n->cond);
+        pop_reg("%rax");
+        emit_str("  cmpq $0, %rax");
+        if n->else_ != 0 {
+            emit_int("  je .Lelse%d", l);
+            gen_stmt(n->then_, ret_label);
+            emit_int("  jmp .Lend%d", l);
+            emit_int(".Lelse%d:", l);
+            gen_stmt(n->else_, ret_label);
+            emit_int(".Lend%d:", l);
+        } else {
+            emit_int("  je .Lend%d", l);
+            gen_stmt(n->then_, ret_label);
+            emit_int(".Lend%d:", l);
+        }
+        return;
+    }
+    if n->kind == ND_WHILE() {
+        var l: int = new_label();
+        emit_int(".Lbegin%d:", l);
+        gen_val(n->cond);
+        pop_reg("%rax");
+        emit_str("  cmpq $0, %rax");
+        emit_int("  je .Lend%d", l);
+        gen_stmt(n->body, ret_label);
+        emit_int("  jmp .Lbegin%d", l);
+        emit_int(".Lend%d:", l);
+        return;
+    }
+    fprintf(stderr_ptr(), "error: gen_stmt: unknown stmt kind\n");
+    exit(1);
+}
+
+func gen_func(n: *Node) {
+    var ret_label: int = new_label();
+
+    emit_1(".globl %s", n->name);
+    emit_1("%s:", n->name);
+    emit_str("  pushq %rbp");
+    emit_str("  movq %rsp, %rbp");
+
+    var lsize: int = n->local_size;
+    if lsize % 16 != 0 {
+        lsize = lsize + 16 - (lsize % 16);
+    }
+    if lsize > 0 {
+        emit_int("  subq $%d, %%rsp", lsize);
+    }
+
+    var i: int = 0;
+    while i < n->params->len && i < 6 {
+        var v: *Var = vec_get(n->params, i);
+        var sz: int = type_size(v->type_);
+        if sz == 1 {
+            emit_int2("  movb %s, %d(%%rbp)", argreg(i), v->offset);
+        } else if sz == 2 {
+            emit_int2("  movw %s, %d(%%rbp)", argreg(i), v->offset);
+        } else if sz == 4 {
+            emit_int2("  movl %s, %d(%%rbp)", argreg(i), v->offset);
+        } else {
+            emit_int2("  movq %s, %d(%%rbp)", argreg(i), v->offset);
+        }
+        i = i + 1;
+    }
+
+    g_stack_depth = 0;
+    gen_stmt(n->func_body, ret_label);
+
+    emit_int(".Lret%d:", ret_label);
+    emit_str("  movq %rbp, %rsp");
+    emit_str("  popq %rbp");
+    emit_str("  ret");
+    emit_str("");
+}
+
+// ================================================================
+// ファイル読み込み
+// ================================================================
+
+func read_file(path: *byte): *byte {
+    var f: *byte = fopen(path, "r");
+    if f == 0 {
+        perror(path);
+        exit(1);
+    }
+    fseek(f, 0, 2);   // SEEK_END = 2
+    var sz: int = ftell(f);
+    rewind(f);
+    var buf: *byte = xmalloc(sz + 1);
+    fread(buf, 1, sz, f);
+    var b: *byte = buf;
+    b[sz] = 0;
+    fclose(f);
+    return buf;
+}
+
+// ================================================================
+// メインドライバ
+// ================================================================
+
+func main(argc: int, argv: *byte): int {
+    if argc < 2 {
+        fprintf(stderr_ptr(), "usage: tinyc <source.tc> [-o output.s]\n");
+        return 1;
+    }
+
+    // argv は *byte として扱い、実際は **char
+    var infile:  *byte = argv_get(argv, 1);
+    var outfile: *byte = "out.s";
+    var i: int = 2;
+    while i < argc {
+        var ai: *byte = argv_get(argv, i);
+        if strcmp(ai, "-o") == 0 && i + 1 < argc {
+            i = i + 1;
+            outfile = argv_get(argv, i);
+        }
+        i = i + 1;
+    }
+
+    var src: *byte = read_file(infile);
+    g_str_literals = new_vec();
+
+    var nodes: *Vec = parse_program(src);
+
+    g_out = fopen(outfile, "w");
+    if g_out == 0 {
+        perror(outfile);
+        return 1;
+    }
+
+    fprintf(g_out, "  .section .note.GNU-stack,\"\",@progbits\n");
+    fprintf(g_out, "  .text\n\n");
+
+    // グローバル変数セクション (ND_EXTERN with var_ set = global var declaration)
+    var has_gv: int = 0;
+    var gv_i: int = 0;
+    while gv_i < nodes->len {
+        var gv_n: *Node = vec_get(nodes, gv_i);
+        if gv_n->kind == ND_EXTERN() && gv_n->var_ != 0 {
+            has_gv = 1;
+        }
+        gv_i = gv_i + 1;
+    }
+    if has_gv {
+        fprintf(g_out, "  .data\n");
+        var gv_j: int = 0;
+        while gv_j < nodes->len {
+            var gv_n: *Node = vec_get(nodes, gv_j);
+            if gv_n->kind == ND_EXTERN() && gv_n->var_ != 0 {
+                fprintf(g_out, ".globl %s\n", gv_n->var_->label);
+                fprintf(g_out, "%s:\n", gv_n->var_->label);
+                if gv_n->ival != 0 {
+                    fprintf(g_out, "  .quad %d\n", gv_n->ival);
+                } else {
+                    fprintf(g_out, "  .zero 8\n");
+                }
+            }
+            gv_j = gv_j + 1;
+        }
+        fprintf(g_out, "\n  .text\n\n");
+    }
+
+    var j: int = 0;
+    while j < nodes->len {
+        var n: *Node = vec_get(nodes, j);
+        if n->kind == ND_FUNC() {
+            gen_func(n);
+        }
+        // ND_EXTERN はスキップ (リンク時に解決)
+        j = j + 1;
+    }
+
+    // 文字列リテラルセクション
+    if g_str_literals->len > 0 {
+        fprintf(g_out, "  .section .rodata\n");
+        var k: int = 0;
+        while k < g_str_literals->len {
+            var sl: *StrLiteral = vec_get(g_str_literals, k);
+            fprintf(g_out, ".LC%d:\n", sl->label);
+            fprintf(g_out, "  .ascii \"");
+            var m: int = 0;
+            var d: *byte = sl->data;
+            while m < sl->len {
+                var c: int = d[m];
+                if c == 34 || c == 92 {
+                    fprintf(g_out, "\\");
+                    fprintf(g_out, "%c", c);
+                } else if c < 32 || c >= 127 {
+                    fprintf(g_out, "\\x%02x", c);
+                } else {
+                    fprintf(g_out, "%c", c);
+                }
+                m = m + 1;
+            }
+            fprintf(g_out, "\\x00\"\n");
+            k = k + 1;
+        }
+    }
+
+    fclose(g_out);
+    return 0;
+}
+
+// argv ヘルパー (char** を tinyc で扱うための補助)
+func argv_get(argv: *byte, i: int): *byte;
+
+// poke_ptr / peek_ptr の実装 (アセンブリ相当、単純なポインタ操作)
+// tinyc の *byte 型を介して 8 バイト境界読み書き
+// これらはhelper.cで実装 (extern)
+func ptr_to_int(p: *byte): int;
+func int_to_ptr(v: int): *byte;
+func stderr_ptr(): *byte;
+func stdout_ptr(): *byte;
